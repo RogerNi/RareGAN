@@ -157,7 +157,7 @@ class Dataset(object):
         batch_ids = np.random.choice(candidates, size=batch_size)
         numpy_inputs = self._numpy_inputs[batch_ids]
         amplifications = self._amplifications[batch_ids]
-        return numpy_inputs, amplifications
+        return numpy_inputs, amplifications, batch_ids
 
     def class_balanced_sample(self, batch_size):
         if self._class_balanced_sampling_weights is None:
