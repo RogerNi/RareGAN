@@ -76,6 +76,10 @@ class RareGAN(object):
         self._TRAINING_STATE_FILE_NAME = 'training_state.npz'
 
     def build(self):
+        self.gen_weight = tf.get_variable("gen_weight", [1])
+        self.data_weights = tf.get_variable("data_weights", [self._request_budget])
+        self.data_weights_bins = []
+
         self._build_connection()
         self._build_loss()
         self._build_summary()
@@ -119,6 +123,11 @@ class RareGAN(object):
             [self._num_amplification_bins],
             name='class_class_weights')
 
+        self._fake_sample_ids_pl = tf.placeholder(
+            tf.int32,
+            [None],
+            name='fake_sample_ids')
+
         self._real_onehots = []
         for i in range(self._num_input_sizes):
             self._real_onehots.append(tf.one_hot(
@@ -156,7 +165,7 @@ class RareGAN(object):
 
         self._disc_real, self._disc_real_class_logits, _ = \
             self._discriminator.build(self._real_onehots, train=True)
-        _, self._class_logits_real, _ = self._discriminator.build(
+        self._class_real, self._class_logits_real, _ = self._discriminator.build(
             self._real_onehots_for_class, train=True)
 
         self._test_disc, self._test_class_logits, _ = \
@@ -167,6 +176,8 @@ class RareGAN(object):
 
     def _build_loss(self):
         batch_size = tf.shape(self._real_indices_pl)[0]
+        norm_fake_weights = tf.math.softmax(tf.concat([self.gen_weight, tf.gather(self.data_weights, self._fake_sample_ids_pl)], 0))
+        expanded_norm_fake_weights = tf.concat([tf.ones(batch_size) * norm_fake_weights[0] / tf.cast(batch_size, tf.float32), norm_fake_weights[1:]], 0)
 
         # Classification weights.
         if self._balanced_class_weights:
@@ -203,10 +214,14 @@ class RareGAN(object):
         if self._balanced_disc_weights:
             disc_fake_class_id = tf.argmax(
                 self._disc_fake_class_logits, axis=1)
+            disc_fake_class_id_full = tf.argmax(
+                  tf.concat([self._disc_fake_class_logits, self._disc_real_class_logits], 0), axis=1)
             disc_real_class_id = tf.argmax(
                 self._disc_real_class_logits, axis=1)
             self._disc_fake_weights = tf.gather(
                 self._disc_class_weights_pl, disc_fake_class_id)
+            self._disc_fake_weights_full = tf.gather(
+                self._disc_class_weights_pl, disc_fake_class_id_full)
             self._disc_real_weights = tf.gather(
                 self._disc_class_weights_pl, disc_real_class_id)
         else:
@@ -214,6 +229,7 @@ class RareGAN(object):
             self._disc_real_weights = tf.ones(shape=[batch_size])
 
         self._disc_fake_weights_mean = tf.reduce_mean(self._disc_fake_weights)
+        self._disc_fake_weights_mean_full = tf.reduce_mean(self._disc_fake_weights_full)
         self._disc_real_weights_mean = tf.reduce_mean(self._disc_real_weights)
 
         # Discriminator losses.
@@ -226,6 +242,8 @@ class RareGAN(object):
             tf.squeeze(self._disc_real, axis=1) * self._disc_real_weights)
         self._disc_loss_fake = tf.reduce_mean(
             tf.squeeze(self._disc_fake, axis=1) * self._disc_fake_weights)
+        self._disc_loss_fake_full = tf.reduce_mean(
+            tf.squeeze(tf.concat([self._disc_fake, self._disc_real], 0), axis=1) * self._disc_fake_weights_full * expanded_norm_fake_weights)
 
         alpha = tf.random_uniform(
             shape=[batch_size, 1],
@@ -244,7 +262,7 @@ class RareGAN(object):
         self._disc_loss_gradient_penalty = tf.reduce_mean((slope - 1.)**2)
 
         self._disc_loss_fake_normalized = (
-            self._disc_loss_fake / self._disc_fake_weights_mean)
+            self._disc_loss_fake_full / self._disc_fake_weights_mean_full)
         self._disc_loss_real_normalized = (
             self._disc_loss_real / self._disc_real_weights_mean)
         self._disc_loss_class_fake_normalized = (
@@ -274,9 +292,17 @@ class RareGAN(object):
         self._gen_loss = (self._gen_loss_fake_normalized * self._gen_disc_coe +
                           self._gen_loss_class_fake_normalized)
 
+        self._gen_weight_loss =  -tf.reduce_mean(
+            tf.squeeze(tf.concat([self._disc_fake, self._disc_real], 0), axis=1) * self._disc_fake_weights_full * expanded_norm_fake_weights)
+        self._gen_weight_loss_normalized = (
+            self._gen_weight_loss / self._disc_fake_weights_mean_full)
+        self._weight_loss = self._gen_weight_loss * self._gen_disc_coe
+
         # Optimizers.
         self._disc_op = tf.train.AdamOptimizer(self._disc_lr).minimize(
             self._disc_loss, var_list=self._discriminator.trainable_vars)
+        self._weight_op = tf.train.AdamOptimizer(self._gen_lr).minimize(
+            self._weight_loss, var_list=[self.data_weights, self.gen_weight])
         self._gen_op = tf.train.AdamOptimizer(self._gen_lr).minimize(
             self._gen_loss, var_list=self._generator.trainable_vars)
 
@@ -443,7 +469,7 @@ class RareGAN(object):
         return np.random.uniform(-1.0, 1.0, [batch_size, self._z_dim])
 
     def gen_conditions(self, batch_size):
-        _, amplifications = self._dataset.uniformly_sample(
+        _, amplifications, _ = self._dataset.uniformly_sample(
             batch_size, condition_filter=-1)
         conditions = amplification_to_class_labels(
             amplifications, [self._target_threshold])
@@ -461,6 +487,8 @@ class RareGAN(object):
             steps=step * np.ones(num_samples, dtype=np.int32),
             conditions=-np.ones(num_samples, dtype=np.int32))
         self._request_usage += num_samples
+
+        self.data_weights_bins.append(num_samples)
 
     def _add_data(self, num_samples, step):
         num_random_packets_to_test = num_samples * self._oversampling_ratio
@@ -487,6 +515,13 @@ class RareGAN(object):
             steps=step * np.ones(num_selected_samples, dtype=np.int32),
             conditions=-2 * np.ones(num_selected_samples, dtype=np.int32))
         self._request_usage += num_selected_samples
+
+        data_weights_np = self._sess.run(self.data_weights)
+        new_weight = np.log(np.exp(self._sess.run(self.gen_weight))/num_samples)
+        data_weights_np[self.data_weights_bins[-1]: self.data_weights_bins[-1] + num_selected_samples] = new_weight
+        self._sess.run(self.data_weights.assign(data_weights_np))
+        self.data_weights_bins.append(num_samples + self.data_weights_bins[-1])
+        self._sess.run(self.gen_weight.assign(new_weight)) 
 
         sys.stdout.flush()
 
@@ -525,7 +560,7 @@ class RareGAN(object):
             self._input_definition.uniformly_sample_numpy(
                 num=self._batch_size, progress_bar=False)
 
-        batch_real_numpy_inputs_for_class, amplifications = \
+        batch_real_numpy_inputs_for_class, amplifications, batch_ids = \
             self._dataset.uniformly_sample(self._batch_size)
         batch_real_conditions_for_class = \
             amplification_to_class_labels(
@@ -549,7 +584,9 @@ class RareGAN(object):
             self._disc_class_weights_pl:
                 self._training_disc_class_weights,
             self._class_class_weights_pl:
-                self._training_class_class_weights
+                self._training_class_class_weights,
+            self._fake_sample_ids_pl:
+                batch_ids
         }
 
         summary_result, _ = self._sess.run(
@@ -557,6 +594,10 @@ class RareGAN(object):
             feed_dict=feed_dict)
         summary_writer.add_summary(
             summary_result, iteration_id)
+
+        _ = self._sess.run(
+            [self._weight_op],
+            feed_dict=feed_dict)
 
         summary_result, _ = self._sess.run(
             [self._gen_summary, self._gen_op],
@@ -675,3 +716,4 @@ class RareGAN(object):
                 break
 
             step_id += 1
+            
